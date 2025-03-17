@@ -1,2 +1,7 @@
 venv/
 CLAUDE.md
+data/
+*.pyc
+__pycache__/
+*.egg-info/
+*.parquet
