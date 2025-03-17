@@ -7,6 +7,7 @@ setup(
     install_requires=[
         "pandas",
         "pyarrow",
+        "geoip2",
     ],
     extras_require={
         "dev": [
