@@ -1,0 +1,12 @@
+Metadata-Version: 2.2
+Name: pflogs
+Version: 0.1.0
+Requires-Dist: pandas
+Requires-Dist: pyarrow
+Provides-Extra: dev
+Requires-Dist: pytest; extra == "dev"
+Requires-Dist: black; extra == "dev"
+Requires-Dist: flake8; extra == "dev"
+Requires-Dist: mypy; extra == "dev"
+Dynamic: provides-extra
+Dynamic: requires-dist
