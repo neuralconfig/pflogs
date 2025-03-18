@@ -19,6 +19,10 @@ from typing import Dict, List, Set, Optional, Union, Tuple, Any, Iterator, Gener
 from functools import lru_cache
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from .config import get_config
+
+# Configure logging
+logger = logging.getLogger(__name__)
 
 # Try to import radix tree for efficient CIDR lookups
 try:
@@ -26,12 +30,7 @@ try:
     RADIX_AVAILABLE = True
 except ImportError:
     RADIX_AVAILABLE = False
-    logging.warning("py-radix not available, falling back to slower CIDR lookup method")
-
-from .config import get_config
-
-# Configure logging
-logger = logging.getLogger(__name__)
+    logger.warning("py-radix not available, falling back to slower CIDR lookup method")
 
 class ThreatIntelError(Exception):
     """Base exception for ThreatIntelligence errors."""
@@ -700,3 +699,60 @@ class ThreatIntelligence:
             enriched_df[f"threat_{source}"] = enriched_df[ip_column].map(lambda ip: source_maps[source].get(ip, False))
         
         return enriched_df
+
+def enrich_with_threat_intel(
+    logs_df: pd.DataFrame, 
+    threat_intel_dir: str, 
+    ip_column: str = 'src_ip', 
+    refresh: bool = False
+) -> pd.DataFrame:
+    """
+    Enrich log data with threat intelligence data only.
+    
+    Args:
+        logs_df: DataFrame containing PF logs
+        threat_intel_dir: Path to the directory containing threat intelligence data
+        ip_column: Name of the column containing IP addresses
+        refresh: Whether to force refresh of threat intelligence data
+        
+    Returns:
+        DataFrame with threat intelligence enrichment
+    """
+    if not threat_intel_dir:
+        return logs_df
+        
+    start_time = datetime.now()
+    
+    try:
+        # Ensure threat directory exists
+        os.makedirs(threat_intel_dir, exist_ok=True)
+        
+        # Create threat intelligence handler
+        threat_intel = ThreatIntelligence(
+            data_dir=threat_intel_dir,
+            auto_refresh=True
+        )
+        
+        # Force refresh if requested
+        if refresh:
+            logger.info("Refreshing threat intelligence data...")
+            threat_intel.refresh_blacklists()
+            
+        # Enrich with threat intelligence data
+        enriched_df = threat_intel.enrich_dataframe(logs_df, ip_column)
+        
+        # Add threat intelligence metadata
+        threat_info = threat_intel.get_blacklist_info()
+        # Store metadata as dataframe attributes
+        enriched_df.attrs['threat_intel_info'] = threat_info
+        
+        end_time = datetime.now()
+        duration = end_time - start_time
+        logger.info(f"Threat intelligence enrichment completed in {duration}")
+        
+        return enriched_df
+        
+    except Exception as e:
+        logger.error(f"Error enriching with threat intelligence: {e}")
+        # Return the original dataframe if there's an error
+        return logs_df

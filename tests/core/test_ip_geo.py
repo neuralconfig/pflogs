@@ -212,8 +212,8 @@ class TestIPGeolocation:
             
             # Override is_private_ip for test
             with patch.object(IPGeolocation, 'is_private_ip', return_value=False):
-                # Mock the lookup_asn method
-                with patch.object(IPGeolocation, 'lookup_asn', return_value={
+                # Mock the _lookup_asn_impl method - note the underscore
+                with patch.object(IPGeolocation, '_lookup_asn_impl', return_value={
                     "asn": 15169,
                     "asn_org": "Google LLC",
                     "network": "8.8.8.0/24"
@@ -284,7 +284,7 @@ class TestIPGeolocation:
                 
                 # Check the results
                 assert len(result) == 3
-                assert result[0]["country_name"] == "US"
+                assert result[0]["country_name"] == "US"  # First IP results
                 assert result[1]["country_name"] == "CA"
                 assert result[2] is None
     

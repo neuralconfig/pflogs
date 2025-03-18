@@ -226,7 +226,7 @@ class IPGeolocation:
             
         return result
 
-    def _process_ip_chunk(self, ips: List[str]) -> List[Dict[str, Any]]:
+    def _process_ip_chunk(self, ips: List[str]) -> List[Optional[Dict[str, Any]]]:
         """Process a chunk of IP addresses in parallel.
 
         Args:
@@ -238,14 +238,16 @@ class IPGeolocation:
         config = get_config()
         max_workers = config.get("processing", "max_workers", 4)
 
-        results = []
+        # Create a list to store results in the same order as input IPs
+        results = [None] * len(ips)
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             # Map IPs to futures
-            future_to_ip = {executor.submit(self.lookup_ip, ip): ip for ip in ips}
+            future_to_index = {executor.submit(self.lookup_ip, ip): i for i, ip in enumerate(ips)}
             
-            # Collect results as they complete
-            for future in as_completed(future_to_ip):
-                results.append(future.result())
+            # Collect results as they complete and store in correct position
+            for future in as_completed(future_to_index):
+                index = future_to_index[future]
+                results[index] = future.result()
                 
         return results
 
@@ -464,3 +466,37 @@ def enrich_logs_with_geo(
         return None
 
     return enriched_df
+
+
+def enrich_with_geolocation(
+    logs_df: pd.DataFrame, 
+    geo_db_path: str, 
+    ip_column: str = 'src_ip', 
+    asn_db_path: Optional[str] = None
+) -> pd.DataFrame:
+    """
+    Enrich log data with geolocation and ASN data only.
+    
+    Args:
+        logs_df: DataFrame containing PF logs
+        geo_db_path: Path to the MaxMind GeoIP2 City database
+        ip_column: Name of the column containing IP addresses
+        asn_db_path: Optional path to the MaxMind GeoIP2 ASN database
+        
+    Returns:
+        DataFrame with geolocation and ASN enrichment
+    """
+    # Check if databases exist
+    if not os.path.exists(geo_db_path):
+        raise FileNotFoundError(f"GeoIP City database '{geo_db_path}' does not exist.")
+        
+    if asn_db_path and not os.path.exists(asn_db_path):
+        raise FileNotFoundError(f"GeoIP ASN database '{asn_db_path}' does not exist.")
+        
+    # Use the core implementation function
+    return enrich_logs_with_geo(
+        logs_df,
+        geo_db_path,
+        ip_column=ip_column,
+        asn_db_path=asn_db_path
+    )

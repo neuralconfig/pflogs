@@ -8,6 +8,7 @@ setup(
         "pandas",
         "pyarrow",
         "geoip2",
+        "py-radix",  # For efficient CIDR range checking
     ],
     extras_require={
         "dev": [
@@ -15,9 +16,6 @@ setup(
             "black",
             "flake8",
             "mypy",
-        ],
-        "performance": [
-            "py-radix",  # For efficient CIDR range checking
         ],
     },
 )
