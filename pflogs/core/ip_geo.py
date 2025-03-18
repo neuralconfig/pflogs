@@ -2,11 +2,13 @@
 IP Geolocation Module.
 
 This module provides functionality to map IP addresses to geographic locations
-using the MaxMind GeoIP2 database.
+using the MaxMind GeoIP2 database, including ASN data.
 """
 
 import os
-from typing import Dict, Any, Optional, List, Union
+import time
+from datetime import datetime
+from typing import Dict, Any, Optional, List, Union, Tuple
 import ipaddress
 import geoip2.database
 import geoip2.errors
@@ -21,33 +23,53 @@ class IPGeolocation:
     using the MaxMind GeoIP2 database.
 
     Attributes:
-        db_path: Path to the MaxMind GeoIP2 database (.mmdb file)
-        reader: GeoIP2 database reader instance
+        geo_db_path: Path to the MaxMind GeoIP2 City database (.mmdb file)
+        geo_reader: GeoIP2 City database reader instance
+        asn_db_path: Path to the MaxMind GeoIP2 ASN database (.mmdb file)
+        asn_reader: GeoIP2 ASN database reader instance
     """
 
-    def __init__(self, db_path: str):
+    def __init__(self, geo_db_path: str, asn_db_path: Optional[str] = None):
         """Initialize the IP Geolocation handler.
 
         Args:
-            db_path: Path to the MaxMind GeoIP2 database (.mmdb file)
+            geo_db_path: Path to the MaxMind GeoIP2 City database (.mmdb file)
+            asn_db_path: Optional path to the MaxMind GeoIP2 ASN database (.mmdb file)
 
         Raises:
             FileNotFoundError: If the database file doesn't exist
             ValueError: If the database file is invalid
         """
-        if not os.path.exists(db_path):
-            raise FileNotFoundError(f"GeoIP database file not found: {db_path}")
+        # Initialize GeoIP City database
+        if not os.path.exists(geo_db_path):
+            raise FileNotFoundError(f"GeoIP City database file not found: {geo_db_path}")
 
         try:
-            self.db_path = db_path
-            self.reader = geoip2.database.Reader(db_path)
+            self.geo_db_path = geo_db_path
+            self.geo_reader = geoip2.database.Reader(geo_db_path)
         except Exception as e:
-            raise ValueError(f"Failed to open GeoIP database: {e}")
+            raise ValueError(f"Failed to open GeoIP City database: {e}")
+            
+        # Initialize GeoIP ASN database if provided
+        self.asn_db_path = asn_db_path
+        self.asn_reader = None
+        
+        if asn_db_path:
+            if not os.path.exists(asn_db_path):
+                raise FileNotFoundError(f"GeoIP ASN database file not found: {asn_db_path}")
+                
+            try:
+                self.asn_reader = geoip2.database.Reader(asn_db_path)
+            except Exception as e:
+                raise ValueError(f"Failed to open GeoIP ASN database: {e}")
 
     def __del__(self):
         """Clean up resources."""
-        if hasattr(self, "reader"):
-            self.reader.close()
+        if hasattr(self, "geo_reader"):
+            self.geo_reader.close()
+            
+        if hasattr(self, "asn_reader") and self.asn_reader:
+            self.asn_reader.close()
 
     def is_private_ip(self, ip_address: str) -> bool:
         """Check if the IP address is private/reserved.
@@ -65,6 +87,32 @@ class IPGeolocation:
             # If we can't parse the IP address, we'll assume it's not private
             return False
 
+    def lookup_asn(self, ip_address: str) -> Optional[Dict[str, Any]]:
+        """Look up ASN information for an IP address.
+
+        Args:
+            ip_address: IP address string
+
+        Returns:
+            Dictionary containing ASN information for the IP address,
+            or None if the IP is private or not found in the database
+        """
+        if self.is_private_ip(ip_address) or not self.asn_reader:
+            return None
+
+        try:
+            response = self.asn_reader.asn(ip_address)
+            return {
+                "asn": response.autonomous_system_number,
+                "asn_org": response.autonomous_system_organization,
+                "network": str(response.network) if response.network else None,
+            }
+        except geoip2.errors.AddressNotFoundError:
+            return None
+        except Exception:
+            # Any other error, we'll just return None for now
+            return None
+
     def lookup_ip(self, ip_address: str) -> Optional[Dict[str, Any]]:
         """Look up geographic information for an IP address.
 
@@ -78,10 +126,12 @@ class IPGeolocation:
         if self.is_private_ip(ip_address):
             return None
 
+        result = {"ip": ip_address}
+        
+        # Try to get city/geo information
         try:
-            response = self.reader.city(ip_address)
-            return {
-                "ip": ip_address,
+            response = self.geo_reader.city(ip_address)
+            result.update({
                 "country_code": response.country.iso_code,
                 "country_name": response.country.name,
                 "city": response.city.name,
@@ -101,12 +151,24 @@ class IPGeolocation:
                     else None
                 ),
                 "postal_code": response.postal.code if response.postal else None,
-            }
+            })
         except geoip2.errors.AddressNotFoundError:
-            return None
+            pass
         except Exception:
-            # Any other error, we'll just return None for now
+            # Any other error, we'll proceed with what we have
+            pass
+            
+        # Try to get ASN information if we have an ASN database
+        if self.asn_reader:
+            asn_info = self.lookup_asn(ip_address)
+            if asn_info:
+                result.update(asn_info)
+                
+        # Return None if we couldn't get any useful information
+        if len(result) <= 1:  # Only has the IP
             return None
+            
+        return result
 
     def enrich_dataframe(
         self, df: pd.DataFrame, ip_column: str = "src_ip"
@@ -130,6 +192,9 @@ class IPGeolocation:
         geo_data = []
         for ip in df[ip_column]:
             geo_info = self.lookup_ip(ip)
+            # Handle None values to prevent errors
+            if geo_info is None:
+                geo_info = {'ip': ip}  # Include the IP but no geo data
             geo_data.append(geo_info)
 
         # Create a DataFrame with the geolocation data
@@ -205,19 +270,25 @@ class IPGeolocation:
 
 def enrich_logs_with_geo(
     logs: Union[pd.DataFrame, str],
-    db_path: str,
+    geo_db_path: str,
     ip_column: str = "src_ip",
     output_path: Optional[str] = None,
+    asn_db_path: Optional[str] = None,
+    threat_intel_dir: Optional[str] = None,
+    refresh_threat_intel: bool = False
 ) -> Optional[pd.DataFrame]:
-    """Enrich log data with geolocation information.
+    """Enrich log data with geolocation and ASN information.
 
-    High-level function to enrich PF logs with geolocation data.
+    High-level function to enrich PF logs with geolocation data and ASN data.
 
     Args:
         logs: DataFrame containing logs or path to a Parquet file
-        db_path: Path to the MaxMind GeoIP2 database (.mmdb file)
+        geo_db_path: Path to the MaxMind GeoIP2 City database (.mmdb file)
         ip_column: Name of the column containing IP addresses to look up
         output_path: Optional path to save the enriched logs as a Parquet file
+        asn_db_path: Optional path to the MaxMind GeoIP2 ASN database (.mmdb file)
+        threat_intel_dir: Optional path to the directory containing threat intel data
+        refresh_threat_intel: Whether to force refresh of threat intel data
 
     Returns:
         A pandas DataFrame if output_path is None, otherwise None
@@ -226,7 +297,8 @@ def enrich_logs_with_geo(
         FileNotFoundError: If the database file or log file doesn't exist
         ValueError: If the specified IP column doesn't exist in the log data
     """
-    geo = IPGeolocation(db_path)
+    # Initialize geo/ASN lookup
+    geo = IPGeolocation(geo_db_path, asn_db_path)
 
     # Load data if a file path was provided
     if isinstance(logs, str):
@@ -236,8 +308,10 @@ def enrich_logs_with_geo(
     else:
         logs_df = logs
 
-    # Enrich with geolocation data
+    # Enrich with geolocation and ASN data
     enriched_df = geo.enrich_dataframe(logs_df, ip_column)
+
+    # Enrich with threat intel is not done here anymore, moved to geo_enrich.py
 
     # Save to Parquet if an output path was provided
     if output_path:

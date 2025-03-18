@@ -54,6 +54,17 @@ def mock_geoip_response():
 
 
 @pytest.fixture
+def mock_asn_response():
+    """Create a mock GeoIP ASN response object."""
+    mock_response = MagicMock()
+    mock_response.autonomous_system_number = 15169
+    mock_response.autonomous_system_organization = "Google LLC"
+    mock_response.network = "8.8.8.0/24"
+    
+    return mock_response
+
+
+@pytest.fixture
 def sample_df():
     """Create a sample DataFrame for testing."""
     return pd.DataFrame({
@@ -68,12 +79,24 @@ class TestIPGeolocation:
     """Test the IPGeolocation class."""
     
     @patch("geoip2.database.Reader")
-    def test_init(self, mock_reader):
-        """Test initialization with a valid database path."""
+    def test_init_geo_only(self, mock_reader):
+        """Test initialization with only geo database."""
         with patch("os.path.exists", return_value=True):
             geo = IPGeolocation("/path/to/db.mmdb")
-            assert geo.db_path == "/path/to/db.mmdb"
+            assert geo.geo_db_path == "/path/to/db.mmdb"
+            assert geo.asn_db_path is None
+            assert geo.asn_reader is None
             mock_reader.assert_called_once_with("/path/to/db.mmdb")
+    
+    @patch("geoip2.database.Reader")
+    def test_init_geo_and_asn(self, mock_reader):
+        """Test initialization with both geo and ASN databases."""
+        with patch("os.path.exists", return_value=True):
+            geo = IPGeolocation("/path/to/geo.mmdb", "/path/to/asn.mmdb")
+            assert geo.geo_db_path == "/path/to/geo.mmdb"
+            assert geo.asn_db_path == "/path/to/asn.mmdb"
+            assert geo.asn_reader is not None
+            assert mock_reader.call_count == 2
     
     @patch("geoip2.database.Reader")
     def test_init_file_not_found(self, mock_reader):
@@ -89,6 +112,15 @@ class TestIPGeolocation:
             mock_reader.side_effect = Exception("Invalid database")
             with pytest.raises(ValueError):
                 IPGeolocation("/path/to/invalid.mmdb")
+    
+    @patch("geoip2.database.Reader")
+    def test_init_invalid_asn_db(self, mock_reader):
+        """Test initialization with an invalid ASN database."""
+        with patch("os.path.exists", return_value=True):
+            # First call is for geo db (success), second call is for ASN db (fail)
+            mock_reader.side_effect = [MagicMock(), Exception("Invalid ASN database")]
+            with pytest.raises(ValueError):
+                IPGeolocation("/path/to/geo.mmdb", "/path/to/invalid_asn.mmdb")
     
     def test_is_private_ip(self):
         """Test private IP detection."""
@@ -120,8 +152,70 @@ class TestIPGeolocation:
                 assert geo.is_private_ip("not_an_ip") is False
     
     @patch("geoip2.database.Reader")
+    def test_lookup_asn(self, mock_reader, mock_asn_response):
+        """Test ASN lookup."""
+        with patch("os.path.exists", return_value=True):
+            # Setup mock reader
+            reader_instance = mock_reader.return_value
+            reader_instance.asn.return_value = mock_asn_response
+            
+            # Test with ASN database
+            geo = IPGeolocation("/path/to/geo.mmdb", "/path/to/asn.mmdb")
+            
+            # Override is_private_ip for test
+            with patch.object(IPGeolocation, 'is_private_ip', return_value=False):
+                # Test a public IP
+                result = geo.lookup_asn("8.8.8.8")
+                assert result["asn"] == 15169
+                assert result["asn_org"] == "Google LLC"
+                assert result["network"] == "8.8.8.0/24"
+                
+                # Test IP not found
+                reader_instance.asn.side_effect = geoip2.errors.AddressNotFoundError("not found")
+                result = geo.lookup_asn("203.0.113.1")
+                assert result is None
+            
+            # Test a private IP
+            with patch.object(IPGeolocation, 'is_private_ip', return_value=True):
+                result = geo.lookup_asn("192.168.1.1")
+                assert result is None
+            
+            # Test with no ASN database
+            with patch.object(IPGeolocation, 'is_private_ip', return_value=False):
+                geo = IPGeolocation("/path/to/geo.mmdb")  # No ASN database
+                assert geo.lookup_asn("8.8.8.8") is None
+    
+    @patch("geoip2.database.Reader")
+    def test_lookup_ip_with_asn(self, mock_reader, mock_geoip_response, mock_asn_response):
+        """Test IP lookup with ASN data."""
+        with patch("os.path.exists", return_value=True):
+            # Setup mock readers
+            reader_instance = mock_reader.return_value
+            reader_instance.city.return_value = mock_geoip_response
+            reader_instance.asn.return_value = mock_asn_response
+            
+            # Create geo instance with both databases
+            geo = IPGeolocation("/path/to/geo.mmdb", "/path/to/asn.mmdb")
+            
+            # Override is_private_ip for test
+            with patch.object(IPGeolocation, 'is_private_ip', return_value=False):
+                # Test a public IP
+                result = geo.lookup_ip("8.8.8.8")
+                
+                # Check city data
+                assert result["ip"] == "8.8.8.8"
+                assert result["country_code"] == "US"
+                assert result["country_name"] == "United States"
+                assert result["city"] == "New York"
+                
+                # Check ASN data
+                assert result["asn"] == 15169
+                assert result["asn_org"] == "Google LLC"
+                assert result["network"] == "8.8.8.0/24"
+    
+    @patch("geoip2.database.Reader")
     def test_lookup_ip(self, mock_reader, mock_geoip_response):
-        """Test IP lookup."""
+        """Test IP lookup without ASN data."""
         with patch("os.path.exists", return_value=True):
             # Setup mock reader to return our mock response
             reader_instance = mock_reader.return_value
@@ -139,6 +233,7 @@ class TestIPGeolocation:
                 assert result["city"] == "New York"
                 assert result["latitude"] == 40.7128
                 assert result["longitude"] == -74.0060
+                assert "asn" not in result
             
             # Test a private IP
             with patch.object(IPGeolocation, 'is_private_ip', return_value=True):
@@ -154,8 +249,51 @@ class TestIPGeolocation:
                 assert result is None
     
     @patch("geoip2.database.Reader")
+    def test_enrich_dataframe_with_asn(self, mock_reader, mock_geoip_response, mock_asn_response, sample_df):
+        """Test enriching a DataFrame with geolocation and ASN data."""
+        with patch("os.path.exists", return_value=True):
+            # Setup mock readers
+            reader_instance = mock_reader.return_value
+            reader_instance.city.return_value = mock_geoip_response
+            reader_instance.asn.return_value = mock_asn_response
+            
+            # Create a mock for lookup_ip that returns expected data with ASN
+            mock_geo_data = {
+                "ip": "203.0.113.1",
+                "country_code": "US",
+                "country_name": "United States",
+                "city": "New York",
+                "latitude": 40.7128,
+                "longitude": -74.0060,
+                "asn": 15169,
+                "asn_org": "Google LLC",
+                "network": "203.0.113.0/24"
+            }
+            
+            with patch.object(IPGeolocation, 'lookup_ip', return_value=mock_geo_data):
+                geo = IPGeolocation("/path/to/geo.mmdb", "/path/to/asn.mmdb")
+                
+                # Enrich the sample DataFrame
+                result_df = geo.enrich_dataframe(sample_df)
+                
+                # Check if geolocation columns are added
+                assert "geo_country_name" in result_df.columns
+                assert "geo_city" in result_df.columns
+                
+                # Check if ASN columns are added
+                assert "geo_asn" in result_df.columns
+                assert "geo_asn_org" in result_df.columns
+                assert "geo_network" in result_df.columns
+                
+                # Check the values
+                assert result_df.loc[0, "geo_country_name"] == "United States"
+                assert result_df.loc[0, "geo_city"] == "New York"
+                assert result_df.loc[0, "geo_asn"] == 15169
+                assert result_df.loc[0, "geo_asn_org"] == "Google LLC"
+    
+    @patch("geoip2.database.Reader")
     def test_enrich_dataframe(self, mock_reader, mock_geoip_response, sample_df):
-        """Test enriching a DataFrame with geolocation data."""
+        """Test enriching a DataFrame with geolocation data only."""
         with patch("os.path.exists", return_value=True):
             # Setup mock reader
             reader_instance = mock_reader.return_value
@@ -337,3 +475,39 @@ def test_enrich_logs_with_geo_file(mock_ipgeo_class):
     with patch("os.path.exists", return_value=False):
         with pytest.raises(FileNotFoundError):
             enrich_logs_with_geo("/path/to/nonexistent.parquet", "/path/to/db.mmdb")
+
+
+@patch("pflogs.core.ip_geo.IPGeolocation")
+def test_enrich_logs_with_geo_asn_and_threat(mock_ipgeo_class, sample_df):
+    """Test enrich_logs_with_geo with ASN data and threat intelligence."""
+    # Since we've moved threat intelligence enrichment to geo_enrich.py,
+    # this test now just verifies that geo and ASN data are properly added
+    
+    # Setup mock
+    mock_ipgeo = mock_ipgeo_class.return_value
+    enriched_df = pd.DataFrame({
+        "timestamp": ["2023-01-01T12:00:00"],
+        "action": ["block"],
+        "src_ip": ["203.0.113.1"],
+        "dst_ip": ["192.168.1.1"],
+        "geo_country_name": ["United States"],
+        "geo_city": ["New York"],
+        "geo_asn": [15169],
+        "geo_asn_org": ["Google LLC"],
+    })
+    mock_ipgeo.enrich_dataframe.return_value = enriched_df
+    
+    # Test with geo and ASN enrichment but not threat intel
+    result = enrich_logs_with_geo(
+        sample_df, 
+        "/path/to/geo.mmdb", 
+        asn_db_path="/path/to/asn.mmdb"
+    )
+    
+    # Check result
+    assert "geo_country_name" in result.columns
+    assert "geo_asn" in result.columns
+    assert "geo_asn_org" in result.columns
+    
+    # Note: We no longer check for threat intelligence columns here
+    # since that's now handled separately in geo_enrich.py
