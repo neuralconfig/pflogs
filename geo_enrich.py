@@ -10,11 +10,103 @@ MaxMind GeoIP2 databases and various threat intelligence feeds.
 import os
 import sys
 import argparse
+import logging
 from datetime import datetime
 import pandas as pd
-from pflogs.core.ip_geo import IPGeolocation
+from concurrent.futures import ThreadPoolExecutor
+from pflogs.core.ip_geo import IPGeolocation, enrich_logs_with_geo, process_df_in_chunks
 from pflogs.core.threat_intel import ThreatIntelligence
+from pflogs.core.config import get_config, initialize_config
 
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+def enrich_with_geolocation(logs_df, geo_db_path, ip_column='src_ip', asn_db_path=None):
+    """
+    Enrich log data with geolocation and ASN data only.
+    
+    Args:
+        logs_df: DataFrame containing PF logs
+        geo_db_path: Path to the MaxMind GeoIP2 City database
+        ip_column: Name of the column containing IP addresses
+        asn_db_path: Optional path to the MaxMind GeoIP2 ASN database
+        
+    Returns:
+        DataFrame with geolocation and ASN enrichment
+    """
+    print(f"Enriching {len(logs_df)} log entries with geolocation data...")
+    start_time = datetime.now()
+    
+    # Use the improved implementation from ip_geo module
+    enriched_df = enrich_logs_with_geo(
+        logs_df,
+        geo_db_path,
+        ip_column=ip_column,
+        asn_db_path=asn_db_path
+    )
+    
+    end_time = datetime.now()
+    duration = end_time - start_time
+    print(f"Geolocation enrichment completed in {duration}")
+    
+    return enriched_df
+
+def enrich_with_threat_intel(logs_df, threat_intel_dir, ip_column='src_ip', refresh=False):
+    """
+    Enrich log data with threat intelligence data only.
+    
+    Args:
+        logs_df: DataFrame containing PF logs
+        threat_intel_dir: Path to the directory containing threat intelligence data
+        ip_column: Name of the column containing IP addresses
+        refresh: Whether to force refresh of threat intelligence data
+        
+    Returns:
+        DataFrame with threat intelligence enrichment
+    """
+    if not threat_intel_dir:
+        return logs_df
+        
+    print(f"Enriching {len(logs_df)} log entries with threat intelligence data...")
+    start_time = datetime.now()
+    
+    try:
+        # Ensure threat directory exists
+        os.makedirs(threat_intel_dir, exist_ok=True)
+        
+        # Create threat intelligence handler
+        threat_intel = ThreatIntelligence(
+            data_dir=threat_intel_dir,
+            auto_refresh=True
+        )
+        
+        # Force refresh if requested
+        if refresh:
+            print("Refreshing threat intelligence data...")
+            threat_intel.refresh_blacklists()
+            
+        # Enrich with threat intelligence data
+        enriched_df = threat_intel.enrich_dataframe(logs_df, ip_column)
+        
+        # Add threat intelligence metadata
+        threat_info = threat_intel.get_blacklist_info()
+        # Store metadata as dataframe attributes
+        enriched_df.attrs['threat_intel_info'] = threat_info
+        
+        end_time = datetime.now()
+        duration = end_time - start_time
+        print(f"Threat intelligence enrichment completed in {duration}")
+        
+        return enriched_df
+        
+    except Exception as e:
+        logger.error(f"Error enriching with threat intelligence: {e}")
+        # Return the original dataframe if there's an error
+        return logs_df
 
 def enrich_logs(logs_path_or_df, geo_db_path, ip_column='src_ip', output_path=None, 
                 asn_db_path=None, threat_intel_dir=None, refresh_threat_intel=False):
@@ -57,39 +149,22 @@ def enrich_logs(logs_path_or_df, geo_db_path, ip_column='src_ip', output_path=No
             raise FileNotFoundError(f"Log file not found: {logs_path_or_df}")
         logs_df = pd.read_parquet(logs_path_or_df)
 
-    # Initialize geo/ASN lookup
-    geo = IPGeolocation(geo_db_path, asn_db_path)
+    # First, enrich with geolocation and ASN data
+    enriched_df = enrich_with_geolocation(
+        logs_df,
+        geo_db_path,
+        ip_column=ip_column,
+        asn_db_path=asn_db_path
+    )
 
-    # Enrich with geolocation and ASN data
-    enriched_df = geo.enrich_dataframe(logs_df, ip_column)
-
-    # Enrich with threat intelligence data if requested
+    # Next, enrich with threat intelligence if requested
     if threat_intel_dir:
-        try:
-            # Ensure threat directory exists
-            os.makedirs(threat_intel_dir, exist_ok=True)
-            
-            # Create threat intelligence handler
-            threat_intel = ThreatIntelligence(
-                data_dir=threat_intel_dir,
-                auto_refresh=True
-            )
-            
-            # Force refresh if requested
-            if refresh_threat_intel:
-                threat_intel.refresh_blacklists()
-                
-            # Enrich with threat intelligence data
-            enriched_df = threat_intel.enrich_dataframe(enriched_df, ip_column)
-            
-            # Add threat intelligence metadata
-            threat_info = threat_intel.get_blacklist_info()
-            # Store metadata as dataframe attributes
-            enriched_df.attrs['threat_intel_info'] = threat_info
-            
-        except Exception as e:
-            import logging
-            logging.warning(f"Error enriching with threat intelligence: {e}")
+        enriched_df = enrich_with_threat_intel(
+            enriched_df,
+            threat_intel_dir,
+            ip_column=ip_column,
+            refresh=refresh_threat_intel
+        )
 
     # Save to Parquet if an output path was provided
     if output_path:
@@ -99,8 +174,67 @@ def enrich_logs(logs_path_or_df, geo_db_path, ip_column='src_ip', output_path=No
     return enriched_df
 
 
+def process_batch(batch_df, geo_db_path, ip_column, asn_db_path, threat_intel_dir, refresh_threat_intel):
+    """
+    Process a batch of log data with enrichment.
+    
+    Args:
+        batch_df: DataFrame batch to process
+        geo_db_path: Path to the GeoIP City database
+        ip_column: Name of the IP column
+        asn_db_path: Path to the ASN database
+        threat_intel_dir: Path to the threat intelligence directory
+        refresh_threat_intel: Whether to refresh threat intel
+        
+    Returns:
+        Enriched DataFrame batch
+    """
+    batch_size = len(batch_df)
+    print(f"  - Starting enrichment for {batch_size} records...")
+    start_batch_time = datetime.now()
+    
+    # Enrich this batch
+    enriched_batch = enrich_logs(
+        batch_df, 
+        geo_db_path, 
+        ip_column,
+        output_path=None,  # Don't save individual batches
+        asn_db_path=asn_db_path,
+        threat_intel_dir=threat_intel_dir,
+        refresh_threat_intel=refresh_threat_intel
+    )
+    
+    end_batch_time = datetime.now()
+    batch_duration = end_batch_time - start_batch_time
+    
+    # Get stats for this batch
+    geo_resolved = enriched_batch['geo_country_name'].notna().sum()
+    geo_percent = geo_resolved / batch_size * 100 if batch_size > 0 else 0
+    
+    asn_resolved = 0
+    if 'geo_asn' in enriched_batch.columns:
+        asn_resolved = enriched_batch['geo_asn'].notna().sum()
+    asn_percent = asn_resolved / batch_size * 100 if batch_size > 0 else 0
+    
+    threat_count = 0
+    if 'threat_is_malicious' in enriched_batch.columns:
+        threat_count = enriched_batch['threat_is_malicious'].sum()
+    threat_percent = threat_count / batch_size * 100 if batch_size > 0 else 0
+    
+    print(f"  - Batch complete: {batch_size} logs processed in {batch_duration}")
+    print(f"  - Geo resolved: {geo_resolved} ({geo_percent:.1f}%), ASN resolved: {asn_resolved} ({asn_percent:.1f}%)")
+    if 'threat_is_malicious' in enriched_batch.columns:
+        print(f"  - Threats identified: {threat_count} ({threat_percent:.1f}%)")
+        
+    return enriched_batch
+
+
 def main():
     """Run the IP geolocation and threat intel enrichment CLI."""
+    # Initialize configuration
+    initialize_config()
+    config = get_config()
+    
     parser = argparse.ArgumentParser(
         description="Enrich PF log data with geolocation, ASN data, and threat intelligence",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -123,6 +257,9 @@ Examples:
   
   # Batch processing by hour
   %(prog)s input.parquet -g data/geo/GeoLite2-City.mmdb -a data/geo/GeoLite2-ASN.mmdb -t data/threat -o enriched.parquet --batch-by hour
+  
+  # Use parallel processing (4 workers)
+  %(prog)s input.parquet -g data/geo/GeoLite2-City.mmdb -a data/geo/GeoLite2-ASN.mmdb -t data/threat -o enriched.parquet --workers 4
 """
     )
     
@@ -184,6 +321,20 @@ Examples:
         help="Process data in batches by time period"
     )
     
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=None,
+        help=f"Size of data chunks to process (default: {config.get('processing', 'chunk_size', 100000)})"
+    )
+    
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help=f"Number of worker processes for parallel processing (default: {config.get('processing', 'max_workers', 4)})"
+    )
+    
     args = parser.parse_args()
     
     # Check if the input path exists
@@ -200,6 +351,13 @@ Examples:
     if args.asn_db and not os.path.exists(args.asn_db):
         print(f"Error: GeoIP ASN database '{args.asn_db}' does not exist.", file=sys.stderr)
         return 1
+    
+    # Update configuration with CLI arguments
+    if args.chunk_size:
+        config.update("processing", "chunk_size", args.chunk_size)
+        
+    if args.workers:
+        config.update("processing", "max_workers", args.workers)
     
     # Prepare enrichment parameters
     enrichment_type = "geolocation"
@@ -238,114 +396,86 @@ Examples:
             print(f"Found {len(batch_keys)} time batches to process")
             
             # Process each batch separately
-            all_enriched_dfs = []
-            for batch_idx, batch_key in enumerate(batch_keys):
-                batch_time = batch_key.strftime("%Y-%m-%d %H:%M")
-                print(f"Processing batch {batch_idx+1}/{len(batch_keys)}: {batch_time}")
-                batch_df = logs_df[logs_df['batch_key'] == batch_key]
-                batch_size = len(batch_df)
-                
-                print(f"  - Starting enrichment for {batch_size} records...")
-                start_batch_time = datetime.now()
-                
-                # Enrich this batch
-                enriched_batch = enrich_logs(
-                    batch_df, 
-                    args.geo_db, 
-                    args.column,
-                    output_path=None,  # Don't save individual batches
-                    asn_db_path=args.asn_db,
-                    threat_intel_dir=args.threat_dir,
-                    refresh_threat_intel=args.refresh_threat if batch_idx == 0 else False  # Only refresh on first batch
-                )
-                
-                end_batch_time = datetime.now()
-                batch_duration = end_batch_time - start_batch_time
-                
-                # Get stats for this batch
-                geo_resolved = enriched_batch['geo_country_name'].notna().sum()
-                geo_percent = geo_resolved / batch_size * 100 if batch_size > 0 else 0
-                
-                asn_resolved = 0
-                if 'asn' in enriched_batch.columns:
-                    asn_resolved = enriched_batch['asn'].notna().sum()
-                asn_percent = asn_resolved / batch_size * 100 if batch_size > 0 else 0
-                
-                threat_count = 0
-                if 'threat_is_malicious' in enriched_batch.columns:
-                    threat_count = enriched_batch['threat_is_malicious'].sum()
-                threat_percent = threat_count / batch_size * 100 if batch_size > 0 else 0
-                
-                all_enriched_dfs.append(enriched_batch)
-                print(f"  - Batch {batch_idx+1} complete: {batch_size} logs processed in {batch_duration}")
-                print(f"  - Geo resolved: {geo_resolved} ({geo_percent:.1f}%), ASN resolved: {asn_resolved} ({asn_percent:.1f}%)")
-                if 'threat_is_malicious' in enriched_batch.columns:
-                    print(f"  - Threats identified: {threat_count} ({threat_percent:.1f}%)")
+            # Allow parallel processing if requested
+            max_workers = config.get("processing", "max_workers")
+            if max_workers > 1:
+                print(f"Processing batches in parallel with {max_workers} workers")
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    futures = []
+                    for batch_idx, batch_key in enumerate(batch_keys):
+                        batch_time = batch_key.strftime("%Y-%m-%d %H:%M")
+                        print(f"Submitting batch {batch_idx+1}/{len(batch_keys)}: {batch_time}")
+                        batch_df = logs_df[logs_df['batch_key'] == batch_key]
+                        
+                        # Only refresh threat intel on first batch
+                        refresh = args.refresh_threat if batch_idx == 0 else False
+                        
+                        # Submit the batch for processing
+                        future = executor.submit(
+                            process_batch,
+                            batch_df,
+                            args.geo_db,
+                            args.column,
+                            args.asn_db,
+                            args.threat_dir,
+                            refresh
+                        )
+                        futures.append((batch_idx, future))
+                    
+                    # Collect results as they complete
+                    all_enriched_dfs = []
+                    for batch_idx, future in sorted(futures, key=lambda x: x[0]):
+                        all_enriched_dfs.append(future.result())
+            else:
+                # Process batches sequentially
+                all_enriched_dfs = []
+                for batch_idx, batch_key in enumerate(batch_keys):
+                    batch_time = batch_key.strftime("%Y-%m-%d %H:%M")
+                    print(f"Processing batch {batch_idx+1}/{len(batch_keys)}: {batch_time}")
+                    batch_df = logs_df[logs_df['batch_key'] == batch_key]
+                    
+                    # Process this batch
+                    enriched_batch = process_batch(
+                        batch_df,
+                        args.geo_db,
+                        args.column,
+                        args.asn_db,
+                        args.threat_dir,
+                        args.refresh_threat if batch_idx == 0 else False  # Only refresh on first batch
+                    )
+                    
+                    all_enriched_dfs.append(enriched_batch)
             
-            # Combine all enriched batches
-            total_batch_rows = sum(len(df) for df in all_enriched_dfs)
+            # Combine all enriched batches while preserving original row count
+            input_row_count = len(logs_df)
+            print(f"Preserving original {input_row_count} rows while combining batches")
             
-            # First approach: preserve original row count by using row numbers
-            # Add a row_id before batching to help identify artificial vs. legitimate duplicates
+            # Create a reference dataframe with original row order
+            reference_df = logs_df.copy()
+            if 'original_index' not in reference_df.columns:
+                reference_df['original_index'] = range(len(reference_df))
             
             # Concatenate batches
-            enriched_df = pd.concat(all_enriched_dfs, ignore_index=True)
+            combined_df = pd.concat(all_enriched_dfs, ignore_index=True)
             
-            # Count how many duplicated rows we have
-            duplicated_count = len(enriched_df) - len(logs_df)
+            # Copy batch keys to ensure we can match back to original
+            if 'batch_key' not in combined_df.columns and 'batch_key' in reference_df.columns:
+                # We need to merge the batch_key back
+                for batch_idx, batch_key in enumerate(batch_keys):
+                    mask = reference_df['batch_key'] == batch_key
+                    reference_rows = reference_df[mask].index
+                    for row_idx in reference_rows:
+                        combined_df.loc[combined_df.index == row_idx, 'batch_key'] = batch_key
             
-            if duplicated_count > 0:
-                print(f"Detected {duplicated_count} potentially artificial duplicates")
-                
-                if duplicated_count > len(logs_df):
-                    print("Artificial duplicate detection: Preserving original row count and data integrity")
-                    
-                    # Create a reference dataframe with original row order
-                    reference_df = logs_df.copy()
-                    if 'original_index' not in reference_df.columns:
-                        reference_df['original_index'] = range(len(reference_df))
-                    
-                    # Get the key columns that identify a unique log entry
-                    # We want to preserve all variations in timestamps, elapsed times, etc.
-                    key_columns = list(reference_df.columns)
-                    if 'batch_key' in key_columns:
-                        key_columns.remove('batch_key')
-                    if 'original_index' in key_columns:
-                        key_columns.remove('original_index')
-                    
-                    # Use the original data as a reference to extract exactly one copy of each
-                    # enriched record that corresponds to an original record
-                    result_rows = []
-                    
-                    # Process each original row to find its corresponding enriched version
-                    for _, orig_row in reference_df.iterrows():
-                        # Build a query to find matching rows in enriched data
-                        query = True
-                        for col in key_columns:
-                            if col in orig_row and col in enriched_df.columns:
-                                query &= (enriched_df[col] == orig_row[col])
-                        
-                        # Get all matching rows and take the first one
-                        matches = enriched_df[query]
-                        if not matches.empty:
-                            result_rows.append(matches.iloc[0])
-                        else:
-                            # If no match (unlikely), use the original row
-                            result_rows.append(orig_row)
-                    
-                    # Create a new dataframe with exactly the same rows as the original
-                    enriched_df = pd.DataFrame(result_rows)
-                    
-                    if 'original_index' in enriched_df.columns:
-                        enriched_df = enriched_df.drop(columns=['original_index'])
-                    
-                    print(f"Preserved original {len(enriched_df)} rows while keeping enrichment data")
-                else:
-                    # If duplication is minimal, just use drop_duplicates to handle it
-                    enriched_df = enriched_df.drop_duplicates()
-                    print(f"Applied simple deduplication, resulting in {len(enriched_df)} rows")
+            # Ensure we maintain the original row count by reindexing
+            enriched_df = pd.DataFrame(index=range(input_row_count))
             
-            print(f"Combined {total_batch_rows} total rows from batches into {len(enriched_df)} final records")
+            # Copy all columns from the combined dataframe
+            for col in combined_df.columns:
+                if col != 'original_index' and col != 'batch_key':
+                    enriched_df[col] = combined_df[col].values
+            
+            print(f"Successfully combined batches into {len(enriched_df)} rows")
             
             # Save to Parquet if output path provided
             if args.output:
@@ -432,21 +562,21 @@ Examples:
                 print("\nNo geolocation data found in the enriched logs.")
                 
             # Display ASN summary
-            asn_columns = [col for col in enriched_df.columns if col in ["asn", "asn_org", "network"]]
+            asn_columns = [col for col in enriched_df.columns if col in ["geo_asn", "geo_asn_org", "geo_network"]]
             if asn_columns:
                 print("\nASN data summary:")
                 
                 # Top ASNs
-                if "asn" in enriched_df.columns:
-                    asn_counts = enriched_df["asn"].value_counts().head(10)
+                if "geo_asn" in enriched_df.columns:
+                    asn_counts = enriched_df["geo_asn"].value_counts().head(10)
                     if not asn_counts.empty:
                         print("\nTop 10 source ASNs:")
                         for asn, count in asn_counts.items():
                             if asn is not None:
                                 # Get the organization name for this ASN if available
                                 asn_org = None
-                                if "asn_org" in enriched_df.columns:
-                                    asn_orgs = enriched_df[enriched_df["asn"] == asn]["asn_org"].unique()
+                                if "geo_asn_org" in enriched_df.columns:
+                                    asn_orgs = enriched_df[enriched_df["geo_asn"] == asn]["geo_asn_org"].unique()
                                     if len(asn_orgs) > 0 and asn_orgs[0] is not None:
                                         asn_org = asn_orgs[0]
                                         
@@ -457,8 +587,8 @@ Examples:
                                 print(f"  {asn_str}: {count} ({count/len(enriched_df)*100:.1f}%)")
                 
                 # Count of unresolved ASNs
-                if "asn" in enriched_df.columns:
-                    null_count = enriched_df["asn"].isna().sum()
+                if "geo_asn" in enriched_df.columns:
+                    null_count = enriched_df["geo_asn"].isna().sum()
                     if null_count > 0:
                         print(f"\nUnresolved ASNs: {null_count} ({null_count/len(enriched_df)*100:.1f}%)")
             
@@ -491,6 +621,8 @@ Examples:
                         
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
         return 1
     
     end_time = datetime.now()

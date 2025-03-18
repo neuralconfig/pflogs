@@ -16,5 +16,8 @@ setup(
             "flake8",
             "mypy",
         ],
+        "performance": [
+            "py-radix",  # For efficient CIDR range checking
+        ],
     },
 )
