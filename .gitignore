@@ -5,3 +5,10 @@ data/
 __pycache__/
 *.egg-info/
 *.parquet
+logs/
+reports/
+*.log
+.mypy_cache/
+.pytest_cache/
+.coverage
+htmlcov/
