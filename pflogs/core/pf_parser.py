@@ -8,7 +8,8 @@ that can be used for analysis and ML processing.
 import re
 from datetime import datetime
 import os
-from typing import Dict, List, Optional, Union, Any
+import gzip
+from typing import Dict, List, Optional, Union, Any, TextIO, BinaryIO
 import pandas as pd
 
 
@@ -108,23 +109,34 @@ class PFLogParser:
             FileNotFoundError: If the specified file doesn't exist.
         """
         parsed_logs = []
-
-        with open(file_path, "r") as f:
-            for line in f:
-                log_entry = self.parse_line(line.strip())
-                if log_entry:
-                    parsed_logs.append(log_entry)
+        
+        # Check if file is gzipped
+        is_gzipped = file_path.endswith('.gz')
+        
+        if is_gzipped:
+            with gzip.open(file_path, 'rt', encoding='utf-8', errors='replace') as f:
+                for line in f:
+                    log_entry = self.parse_line(line.strip())
+                    if log_entry:
+                        parsed_logs.append(log_entry)
+        else:
+            with open(file_path, "r", encoding='utf-8', errors='replace') as f:
+                for line in f:
+                    log_entry = self.parse_line(line.strip())
+                    if log_entry:
+                        parsed_logs.append(log_entry)
 
         return parsed_logs
 
     def parse_directory(
-        self, dir_path: str, pattern: str = "*.log"
+        self, dir_path: str, pattern: str = "*.log*"
     ) -> List[Dict[str, Any]]:
         """Parse all matching files in a directory.
 
         Args:
             dir_path: Path to the directory containing PF log files.
-            pattern: Glob pattern to match specific log files (default: '*.log').
+            pattern: Glob pattern to match specific log files (default: '*.log*').
+                     The default pattern will match both .log and .log.gz files.
 
         Returns:
             A list of dictionaries containing the parsed log entries.

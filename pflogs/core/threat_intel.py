@@ -12,17 +12,37 @@ import urllib.request
 import urllib.error
 import time
 import logging
+import json
+import hashlib
 from datetime import datetime, timedelta
-from typing import Dict, List, Set, Optional, Union, Tuple, Any
+from typing import Dict, List, Set, Optional, Union, Tuple, Any, Iterator, Generator
+from functools import lru_cache
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from .config import get_config
 
 # Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
 logger = logging.getLogger(__name__)
+
+# Try to import radix tree for efficient CIDR lookups
+try:
+    import radix
+    RADIX_AVAILABLE = True
+except ImportError:
+    RADIX_AVAILABLE = False
+    logger.warning("py-radix not available, falling back to slower CIDR lookup method")
+
+class ThreatIntelError(Exception):
+    """Base exception for ThreatIntelligence errors."""
+    pass
+
+class ThreatIntelNetworkError(ThreatIntelError):
+    """Exception raised for network errors during threat feed downloads."""
+    pass
+
+class ThreatIntelDataError(ThreatIntelError):
+    """Exception raised for errors processing threat feed data."""
+    pass
 
 class ThreatIntelligence:
     """Threat Intelligence handler for IP reputation data.
@@ -34,6 +54,7 @@ class ThreatIntelligence:
         data_dir: Directory to store threat intelligence data
         sources: Dictionary of threat intelligence sources with their URLs
         blacklists: Dictionary of IP sets from different sources
+        rtrees: Dictionary of radix trees for efficient CIDR lookups
         metadata: Information about when each source was last updated
         last_refresh: Timestamp of when blacklists were last refreshed
     """
@@ -46,8 +67,9 @@ class ThreatIntelligence:
     
     def __init__(self, data_dir: str = None, 
                  sources: Dict[str, str] = None,
-                 refresh_interval: int = 86400,  # Default: 24 hours
-                 auto_refresh: bool = True):
+                 refresh_interval: int = None,
+                 auto_refresh: bool = None,
+                 cache_size: int = None):
         """Initialize the Threat Intelligence handler.
         
         Args:
@@ -55,37 +77,64 @@ class ThreatIntelligence:
             sources: Dictionary of threat intelligence sources with their URLs
             refresh_interval: How often to refresh the data in seconds
             auto_refresh: Whether to automatically refresh stale data when needed
+            cache_size: Size of the LRU cache for IP lookups
             
         Raises:
             ValueError: If data_dir is not provided and cannot be determined
         """
+        # Get configuration
+        config = get_config()
+        
         # Set the data directory
         if data_dir:
             self.data_dir = data_dir
         else:
-            # Try to use a default directory
-            script_dir = os.path.dirname(os.path.realpath(__file__))
-            default_data_dir = os.path.abspath(os.path.join(script_dir, '..', '..', 'data', 'threat'))
-            if os.path.exists(default_data_dir):
-                self.data_dir = default_data_dir
+            # Try to use the configured directory
+            config_data_dir = config.get("threat_intel", "data_dir")
+            if config_data_dir:
+                self.data_dir = config_data_dir
             else:
-                raise ValueError("Data directory must be provided or 'data/threat' must exist")
-                
+                # Try to use a default directory
+                script_dir = os.path.dirname(os.path.realpath(__file__))
+                default_data_dir = os.path.abspath(os.path.join(script_dir, '..', '..', 'data', 'threat'))
+                if os.path.exists(default_data_dir):
+                    self.data_dir = default_data_dir
+                else:
+                    raise ValueError("Data directory must be provided or 'data/threat' must exist")
+                    
         # Create the data directory if it doesn't exist
         os.makedirs(self.data_dir, exist_ok=True)
         
         # Set the sources
         self.sources = sources if sources else self.DEFAULT_SOURCES
         
+        # Get configuration values or use provided values
+        self.refresh_interval = refresh_interval or config.get("threat_intel", "refresh_interval", 86400)
+        self.auto_refresh = auto_refresh if auto_refresh is not None else config.get("threat_intel", "auto_refresh", True)
+        self.cache_size = cache_size or config.get("threat_intel", "cache_size", 100000)
+        
+        # Configure LRU cache with bounded size
+        # We create a class-level decorator that applies to the instance method
+        self.is_malicious = lru_cache(maxsize=self.cache_size)(self._is_malicious_impl)
+        
         # Initialize empty blacklists and metadata
         self.blacklists = {}
+        self.rtrees = {}
         self.metadata = {}
         self.last_refresh = None
-        self.refresh_interval = refresh_interval
-        self.auto_refresh = auto_refresh
         
         # Load the blacklists
         self._load_blacklists()
+        
+        logger.info(f"Initialized ThreatIntelligence with {len(self.sources)} sources, {self.cache_size} cache size")
+        
+    def __del__(self):
+        """Clean up resources."""
+        # Clear caches
+        try:
+            self.is_malicious.cache_clear()
+        except:
+            pass
         
     def _load_blacklists(self) -> None:
         """Load blacklists from files or download if necessary."""
@@ -101,32 +150,58 @@ class ThreatIntelligence:
             
             if file_exists and meta_exists:
                 # Load metadata
-                with open(meta_path, 'r') as f:
-                    meta_content = f.read().strip()
-                    try:
-                        timestamp_str, count_str, url_str, *extra = meta_content.split('|')
-                        timestamp = float(timestamp_str)
-                        count = int(count_str)
-                        
-                        self.metadata[source_name] = {
-                            'timestamp': timestamp,
-                            'count': count,
-                            'url': url_str
-                        }
-                        
-                        # Check if file is too old
-                        if time.time() - timestamp > self.refresh_interval:
-                            logger.info(f"Blacklist {source_name} is outdated. Will refresh.")
-                            all_sources_valid = False
-                    except (ValueError, IndexError):
-                        logger.warning(f"Invalid metadata format for {source_name}. Will refresh.")
-                        all_sources_valid = False
+                try:
+                    with open(meta_path, 'r') as f:
+                        meta_content = f.read().strip()
+                        try:
+                            metadata = json.loads(meta_content)
+                            timestamp = metadata.get('timestamp', 0)
+                            count = metadata.get('count', 0)
+                            url_str = metadata.get('url', '')
+                            
+                            self.metadata[source_name] = {
+                                'timestamp': timestamp,
+                                'count': count,
+                                'url': url_str
+                            }
+                            
+                            # Check if file is too old
+                            if time.time() - timestamp > self.refresh_interval:
+                                logger.info(f"Blacklist {source_name} is outdated. Will refresh.")
+                                all_sources_valid = False
+                        except json.JSONDecodeError:
+                            # Try legacy format
+                            try:
+                                timestamp_str, count_str, url_str, *extra = meta_content.split('|')
+                                timestamp = float(timestamp_str)
+                                count = int(count_str)
+                                
+                                self.metadata[source_name] = {
+                                    'timestamp': timestamp,
+                                    'count': count,
+                                    'url': url_str
+                                }
+                                
+                                # Check if file is too old
+                                if time.time() - timestamp > self.refresh_interval:
+                                    logger.info(f"Blacklist {source_name} is outdated. Will refresh.")
+                                    all_sources_valid = False
+                                    
+                                # Write in new JSON format for next time
+                                self._write_metadata(source_name, timestamp, count, url_str)
+                            except (ValueError, IndexError):
+                                logger.warning(f"Invalid metadata format for {source_name}. Will refresh.")
+                                all_sources_valid = False
+                except Exception as e:
+                    logger.warning(f"Error reading metadata for {source_name}: {e}. Will refresh.")
+                    all_sources_valid = False
             else:
                 logger.info(f"Blacklist {source_name} does not exist. Will download.")
                 all_sources_valid = False
                 
         # If any source is invalid or too old, refresh all sources
         if not all_sources_valid and self.auto_refresh:
+            logger.info("Some blacklists are missing or outdated, refreshing all sources")
             self.refresh_blacklists()
         else:
             # Load existing files
@@ -135,7 +210,35 @@ class ThreatIntelligence:
                 if os.path.exists(file_path):
                     self.blacklists[source_name] = self._load_ip_set(file_path)
                     
+                    # Initialize radix tree if available
+                    if RADIX_AVAILABLE:
+                        self.rtrees[source_name] = self._build_radix_tree(self.blacklists[source_name])
+                    
             self.last_refresh = time.time()
+            logger.info(f"Loaded {sum(len(bl) for bl in self.blacklists.values())} IPs from {len(self.blacklists)} blacklists")
+    
+    def _write_metadata(self, source_name: str, timestamp: float, count: int, url: str) -> None:
+        """Write metadata in JSON format.
+        
+        Args:
+            source_name: Name of the source
+            timestamp: Timestamp when the source was last updated
+            count: Number of entries in the source
+            url: URL of the source
+        """
+        meta_path = os.path.join(self.data_dir, f"{source_name}.meta")
+        try:
+            metadata = {
+                'timestamp': timestamp,
+                'count': count,
+                'url': url,
+                'hash': hashlib.md5(f"{timestamp}:{count}:{url}".encode()).hexdigest()
+            }
+            
+            with open(meta_path, 'w') as f:
+                json.dump(metadata, f)
+        except Exception as e:
+            logger.warning(f"Error writing metadata for {source_name}: {e}")
     
     def _load_ip_set(self, file_path: str) -> Set[str]:
         """Load a set of IP addresses or CIDR ranges from a file.
@@ -171,11 +274,43 @@ class ThreatIntelligence:
                         ip_set.add(ip_or_range)
                     except ValueError:
                         # Skip invalid IP addresses
+                        logger.debug(f"Skipping invalid IP/CIDR: {ip_or_range}")
                         continue
         except Exception as e:
             logger.error(f"Error loading IP set from {file_path}: {e}")
             
         return ip_set
+    
+    def _build_radix_tree(self, ip_set: Set[str]) -> Optional['radix.Radix']:
+        """Build a radix tree for efficient CIDR lookups.
+        
+        Args:
+            ip_set: Set of IP addresses or CIDR ranges
+            
+        Returns:
+            Radix tree object if radix module is available, None otherwise
+        """
+        if not RADIX_AVAILABLE:
+            return None
+            
+        rtree = radix.Radix()
+        
+        for ip_or_cidr in ip_set:
+            try:
+                if '/' in ip_or_cidr:
+                    # CIDR range
+                    rtree.add(ip_or_cidr)
+                else:
+                    # Single IP (add as /32 or /128)
+                    ip = ipaddress.ip_address(ip_or_cidr)
+                    if ip.version == 4:
+                        rtree.add(f"{ip_or_cidr}/32")
+                    else:
+                        rtree.add(f"{ip_or_cidr}/128")
+            except Exception as e:
+                logger.debug(f"Error adding {ip_or_cidr} to radix tree: {e}")
+                
+        return rtree
         
     def refresh_blacklists(self) -> bool:
         """Download and refresh all blacklists.
@@ -186,7 +321,14 @@ class ThreatIntelligence:
         logger.info("Refreshing threat intelligence blacklists...")
         success = True
         
-        with ThreadPoolExecutor(max_workers=min(4, len(self.sources))) as executor:
+        # Get max workers from config, but limit by number of sources
+        config = get_config()
+        max_workers = min(
+            config.get("processing", "max_workers", 4),
+            len(self.sources)
+        )
+        
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_source = {
                 executor.submit(self._download_blacklist, source_name, url): source_name
                 for source_name, url in self.sources.items()
@@ -203,6 +345,10 @@ class ThreatIntelligence:
                     success = False
                     
         self.last_refresh = time.time()
+        
+        # Clear cache after refresh
+        self.is_malicious.cache_clear()
+        
         return success
         
     def _download_blacklist(self, source_name: str, url: str) -> bool:
@@ -214,10 +360,12 @@ class ThreatIntelligence:
             
         Returns:
             True if successful, False otherwise
+            
+        Raises:
+            ThreatIntelNetworkError: If there's a network error during download
         """
         file_path = os.path.join(self.data_dir, f"{source_name}.netset")
         temp_path = f"{file_path}.tmp"
-        meta_path = os.path.join(self.data_dir, f"{source_name}.meta")
         
         try:
             logger.info(f"Downloading {source_name} from {url}...")
@@ -228,8 +376,12 @@ class ThreatIntelligence:
                 headers={'User-Agent': 'pflogs-threat-intelligence/1.0'}
             )
             
+            start_time = time.time()
             with urllib.request.urlopen(req, timeout=30) as response:
                 content = response.read().decode('utf-8', errors='ignore')
+                download_time = time.time() - start_time
+                content_length = len(content)
+                logger.info(f"Downloaded {content_length} bytes in {download_time:.2f} seconds")
                 
                 # Process the content based on the source
                 processed_content = self._process_content(source_name, content)
@@ -261,11 +413,16 @@ class ThreatIntelligence:
                     
                     # Update metadata
                     timestamp = time.time()
-                    with open(meta_path, 'w') as f:
-                        f.write(f"{timestamp}|{count}|{url}")
-                        
+                    self._write_metadata(source_name, timestamp, count, url)
+                    
                     # Update in-memory data
                     self.blacklists[source_name] = ip_set
+                    
+                    # Update radix tree if available
+                    if RADIX_AVAILABLE:
+                        self.rtrees[source_name] = self._build_radix_tree(ip_set)
+                    
+                    # Update metadata
                     self.metadata[source_name] = {
                         'timestamp': timestamp,
                         'count': count,
@@ -283,6 +440,9 @@ class ThreatIntelligence:
                             logger.warning(f"Failed to remove temporary file {temp_path}: {e}")
                     return False
                     
+        except urllib.error.URLError as e:
+            logger.error(f"Network error downloading {source_name}: {e}")
+            raise ThreatIntelNetworkError(f"Network error downloading {source_name}: {e}")
         except Exception as e:
             logger.error(f"Error downloading {source_name}: {e}")
             if os.path.exists(temp_path):
@@ -325,15 +485,43 @@ class ThreatIntelligence:
         else:
             # Default processing - just return the content
             return content
+    
+    def _check_ip_in_cidr_ranges(self, ip_obj: 'ipaddress.IPv4Address' or 'ipaddress.IPv6Address', 
+                              source: str) -> bool:
+        """Check if an IP is in any CIDR range using most efficient method available.
+        
+        Args:
+            ip_obj: IP address object
+            source: Source name
             
-    # Cache for IP lookups to avoid rechecking the same IPs
-    _ip_cache = {}
+        Returns:
+            True if the IP is in any CIDR range, False otherwise
+        """
+        # Use radix tree if available for more efficient lookups
+        if RADIX_AVAILABLE and source in self.rtrees and self.rtrees[source]:
+            try:
+                ip_str = str(ip_obj)
+                rnode = self.rtrees[source].search_best(ip_str)
+                return rnode is not None
+            except Exception as e:
+                logger.debug(f"Error searching radix tree: {e}")
+                # Fall back to manual search
+                pass
+        
+        # Manual CIDR check as fallback
+        for entry in self.blacklists[source]:
+            if '/' in entry:
+                try:
+                    network = ipaddress.ip_network(entry, strict=False)
+                    if ip_obj in network:
+                        return True
+                except ValueError:
+                    continue
+                    
+        return False
     
-    # Cache for parsed network objects (expensive to create)
-    _network_cache = {}
-    
-    def is_malicious(self, ip_address: str, check_all: bool = False) -> Union[bool, Dict[str, bool]]:
-        """Check if an IP address is in any blacklist.
+    def _is_malicious_impl(self, ip_address: str, check_all: bool = False) -> Union[bool, Dict[str, bool]]:
+        """Implementation of malicious IP check (used by lru_cache wrapper).
         
         Args:
             ip_address: IP address to check
@@ -343,27 +531,19 @@ class ThreatIntelligence:
             If check_all is False: True if the IP is in any blacklist, False otherwise
             If check_all is True: Dictionary mapping source names to boolean results
         """
-        # Check cache first (major performance optimization for repeatedly seen IPs)
-        cache_key = f"{ip_address}:{check_all}"
-        if cache_key in self._ip_cache:
-            return self._ip_cache[cache_key]
-            
         # Refresh blacklists if needed, but don't do this for every IP check
         # Only do it once per session
         if self.auto_refresh and (not self.last_refresh or 
                                time.time() - self.last_refresh > self.refresh_interval):
             self.refresh_blacklists()
-            # Clear caches when blacklists are refreshed
-            self._ip_cache = {}
-            self._network_cache = {}
             
         # Try to convert the IP to an IP address object
         try:
             ip_obj = ipaddress.ip_address(ip_address)
         except ValueError:
             # Invalid IP address
+            logger.debug(f"Invalid IP address: {ip_address}")
             result = {source: False for source in self.blacklists} if check_all else False
-            self._ip_cache[cache_key] = result
             return result
             
         # Check each blacklist
@@ -373,45 +553,23 @@ class ThreatIntelligence:
             if ip_address in ip_set:
                 results[source] = True
                 if not check_all:
-                    self._ip_cache[cache_key] = True
                     return True
                 continue
             
             # Next, check if the IP is in any CIDR range
-            # Use cached network objects for better performance
-            if source not in self._network_cache:
-                # Initialize cache for this source
-                self._network_cache[source] = []
+            if self._check_ip_in_cidr_ranges(ip_obj, source):
+                results[source] = True
+                if not check_all:
+                    return True
+            else:
+                results[source] = False
                 
-                # Parse all CIDR ranges once and cache them
-                for entry in ip_set:
-                    if '/' in entry:
-                        try:
-                            network = ipaddress.ip_network(entry, strict=False)
-                            self._network_cache[source].append(network)
-                        except ValueError:
-                            continue
-            
-            # Now check against cached networks (much faster)
-            found = False
-            for network in self._network_cache[source]:
-                if ip_obj in network:
-                    found = True
-                    break
-                        
-            results[source] = found
-            if found and not check_all:
-                self._ip_cache[cache_key] = True
-                return True
-                
-        # Cache and return the result
+        # Return results
         if check_all:
-            self._ip_cache[cache_key] = results
             return results
         
-        result = any(results.values())
-        self._ip_cache[cache_key] = result
-        return result
+        # If we got here, the IP wasn't found in any blacklist
+        return any(results.values())
         
     def get_blacklist_info(self) -> Dict[str, Dict[str, Any]]:
         """Get information about the blacklists.
@@ -421,13 +579,37 @@ class ThreatIntelligence:
         """
         info = {}
         for source, metadata in self.metadata.items():
+            timestamp = metadata.get('timestamp', 0)
+            update_time = datetime.fromtimestamp(timestamp)
+            age = timedelta(seconds=int(time.time() - timestamp))
+            
             info[source] = {
                 'count': metadata.get('count', 0),
-                'updated': datetime.fromtimestamp(metadata.get('timestamp', 0)).strftime('%Y-%m-%d %H:%M:%S'),
+                'updated': update_time.strftime('%Y-%m-%d %H:%M:%S'),
                 'url': metadata.get('url', self.sources.get(source, 'Unknown')),
-                'age': str(timedelta(seconds=int(time.time() - metadata.get('timestamp', 0)))),
+                'age': str(age),
             }
         return info
+    
+    def process_ips_in_chunks(self, ips: List[str], chunk_size: int = None) -> Generator[Tuple[List[str], List[Dict[str, bool]]], None, None]:
+        """Process IPs in chunks to reduce memory usage and provide progress updates.
+        
+        Args:
+            ips: List of IP addresses to check
+            chunk_size: Size of each chunk, defaults to config value
+            
+        Yields:
+            Tuple of (chunk of IPs, results for each IP)
+        """
+        if chunk_size is None:
+            config = get_config()
+            chunk_size = config.get("threat_intel", "batch_size", 50)
+            
+        total = len(ips)
+        for i in range(0, total, chunk_size):
+            chunk = ips[i:i+chunk_size]
+            results = [self.is_malicious(ip, check_all=True) for ip in chunk]
+            yield (chunk, results)
         
     def enrich_dataframe(self, df: pd.DataFrame, ip_column: str = "src_ip") -> pd.DataFrame:
         """Enrich a DataFrame with threat intelligence data.
@@ -438,8 +620,12 @@ class ThreatIntelligence:
             
         Returns:
             DataFrame with added threat intelligence columns
+            
+        Raises:
+            ValueError: If the specified IP column doesn't exist in the DataFrame
         """
         if ip_column not in df.columns:
+            logger.error(f"IP column '{ip_column}' not found in DataFrame")
             raise ValueError(f"IP column '{ip_column}' not found in DataFrame")
             
         # Create a new dataframe to avoid modifying the original
@@ -453,38 +639,43 @@ class ThreatIntelligence:
         
         # Pre-compute the threat intelligence results for each unique IP
         # Use batching to provide progress updates
-        ip_results = {}
-        batch_size = 50  # Process IPs in smaller batches to show progress
+        config = get_config()
+        batch_size = config.get("threat_intel", "batch_size", 50)
         start_time = time.time()
         malicious_count = 0
         
-        for i in range(0, total_ips, batch_size):
-            batch = unique_ips[i:i+batch_size]
-            batch_end = min(i + batch_size, total_ips)
+        # Create mapping dictionaries for all sources
+        threat_is_malicious_map = {}
+        source_maps = {source: {} for source in self.blacklists}
+        
+        # Process in batches
+        for i, (batch, results) in enumerate(self.process_ips_in_chunks(unique_ips, batch_size)):
+            batch_end = min((i+1) * batch_size, total_ips)
             current_time = time.time()
             elapsed = current_time - start_time
             
             # Estimate time remaining
             if i > 0:
-                ips_per_second = i / elapsed if elapsed > 0 else 0
-                remaining_ips = total_ips - i
+                ips_per_second = i * batch_size / elapsed if elapsed > 0 else 0
+                remaining_ips = total_ips - i * batch_size
                 eta_seconds = remaining_ips / ips_per_second if ips_per_second > 0 else 0
                 eta_str = f", ETA: {int(eta_seconds//60)}m {int(eta_seconds%60)}s"
             else:
                 eta_str = ""
                 
-            print(f"Processing IPs {i+1}-{batch_end} of {total_ips} ({(i+1)/total_ips*100:.1f}%{eta_str})")
+            print(f"Processing IPs {i*batch_size+1}-{batch_end} of {total_ips} ({(i*batch_size+1)/total_ips*100:.1f}%{eta_str})")
             
-            # Process this batch
-            for ip in batch:
-                try:
-                    result = self.is_malicious(ip, check_all=True)
-                    ip_results[ip] = result
-                    if any(result.values()):
-                        malicious_count += 1
-                except Exception as e:
-                    logger.warning(f"Error checking IP {ip}: {e}")
-                    ip_results[ip] = {source: False for source in self.blacklists}
+            # Update mapping dictionaries
+            for ip, result in zip(batch, results):
+                is_malicious = any(result.values())
+                threat_is_malicious_map[ip] = is_malicious
+                
+                if is_malicious:
+                    malicious_count += 1
+                
+                # Update each source map
+                for source in self.blacklists:
+                    source_maps[source][ip] = result.get(source, False)
         
         # Report total time and stats
         total_time = time.time() - start_time
@@ -499,17 +690,69 @@ class ThreatIntelligence:
             enriched_df[f"threat_{source}"] = False
         
         print("Applying threat intelligence data to dataframe...")
-        # Apply the results to the dataframe more efficiently using dictionary mapping
-        # First create a mapping for the main flag
-        threat_is_malicious_map = {ip: any(results.values()) for ip, results in ip_results.items()}
-        # Apply it using map operation (faster than row-by-row)
+        
+        # Apply the results using map operation (faster than row-by-row)
         enriched_df['threat_is_malicious'] = enriched_df[ip_column].map(lambda ip: threat_is_malicious_map.get(ip, False))
         
-        # Do the same for each source
+        # Apply source-specific results
         for source in sources:
-            # Create mapping for this source
-            source_map = {ip: results.get(source, False) for ip, results in ip_results.items()}
-            # Apply it
-            enriched_df[f"threat_{source}"] = enriched_df[ip_column].map(lambda ip: source_map.get(ip, False))
+            enriched_df[f"threat_{source}"] = enriched_df[ip_column].map(lambda ip: source_maps[source].get(ip, False))
         
         return enriched_df
+
+def enrich_with_threat_intel(
+    logs_df: pd.DataFrame, 
+    threat_intel_dir: str, 
+    ip_column: str = 'src_ip', 
+    refresh: bool = False
+) -> pd.DataFrame:
+    """
+    Enrich log data with threat intelligence data only.
+    
+    Args:
+        logs_df: DataFrame containing PF logs
+        threat_intel_dir: Path to the directory containing threat intelligence data
+        ip_column: Name of the column containing IP addresses
+        refresh: Whether to force refresh of threat intelligence data
+        
+    Returns:
+        DataFrame with threat intelligence enrichment
+    """
+    if not threat_intel_dir:
+        return logs_df
+        
+    start_time = datetime.now()
+    
+    try:
+        # Ensure threat directory exists
+        os.makedirs(threat_intel_dir, exist_ok=True)
+        
+        # Create threat intelligence handler
+        threat_intel = ThreatIntelligence(
+            data_dir=threat_intel_dir,
+            auto_refresh=True
+        )
+        
+        # Force refresh if requested
+        if refresh:
+            logger.info("Refreshing threat intelligence data...")
+            threat_intel.refresh_blacklists()
+            
+        # Enrich with threat intelligence data
+        enriched_df = threat_intel.enrich_dataframe(logs_df, ip_column)
+        
+        # Add threat intelligence metadata
+        threat_info = threat_intel.get_blacklist_info()
+        # Store metadata as dataframe attributes
+        enriched_df.attrs['threat_intel_info'] = threat_info
+        
+        end_time = datetime.now()
+        duration = end_time - start_time
+        logger.info(f"Threat intelligence enrichment completed in {duration}")
+        
+        return enriched_df
+        
+    except Exception as e:
+        logger.error(f"Error enriching with threat intelligence: {e}")
+        # Return the original dataframe if there's an error
+        return logs_df

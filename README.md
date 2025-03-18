@@ -5,7 +5,11 @@ ML-enhanced security analysis system for PF-based firewalls that identifies atta
 ## Features
 
 - Log parsing for PF firewall logs
-- IP Geolocation for attack source identification
+- IP Geolocation and ASN lookup for attack source identification
+- Threat intelligence integration with multiple sources
+- Compressed log file support (.gz)
+- Efficient memory usage for processing large datasets
+- Multi-threaded processing for better performance
 - Structured data storage in Parquet format
 - Anomaly detection (coming soon)
 - Attack classification (coming soon)
@@ -32,15 +36,21 @@ ML-enhanced security analysis system for PF-based firewalls that identifies atta
    pip install -e .
    ```
 
-4. Download the MaxMind GeoLite2 City database for IP geolocation:
+4. Download the MaxMind GeoLite2 databases for IP geolocation and ASN information:
    
-   You'll need to create a free MaxMind account at https://www.maxmind.com/en/geolite2/signup and download the GeoLite2 City database in .mmdb format.
+   You'll need to create a free MaxMind account at https://www.maxmind.com/en/geolite2/signup and download both the GeoLite2 City and GeoLite2 ASN databases in .mmdb format.
    
    ```bash
-   # After downloading, place it in a location accessible to your application:
-   mkdir -p data/geo
-   # Copy the downloaded database to the data/geo directory
+   # After downloading, place them in a location accessible to your application:
+   mkdir -p data/{geo,threat}
+   # Copy the downloaded databases to the data/geo directory
    cp /path/to/downloaded/GeoLite2-City.mmdb data/geo/
+   cp /path/to/downloaded/GeoLite2-ASN.mmdb data/geo/
+   ```
+
+5. Update threat intelligence data:
+   ```bash
+   python3 -m scripts.update_threat_intel -o data/threat
    ```
 
 ## Usage
@@ -65,30 +75,40 @@ Limit the number of sample entries displayed:
 ./parse_logs.py /var/log/pf/hostname/yyyy/mm/dd/pf.log --sample 10
 ```
 
-### IP Geolocation
+### Enrichment
 
-Enrich parsed logs with geolocation data:
+#### Geo & ASN Enrichment
+
+Enrich parsed logs with geolocation and ASN data:
 
 ```bash
-./geo_enrich.py /path/to/parsed_logs.parquet -d /path/to/GeoLite2-City.mmdb
+python3 -m scripts.geo_enrich data/output.parquet -g data/geo/GeoLite2-City.mmdb -a data/geo/GeoLite2-ASN.mmdb -o data/enriched.parquet
 ```
 
-Save enriched logs to a Parquet file:
+#### Threat Intelligence Enrichment
+
+Enrich logs with threat intelligence data:
 
 ```bash
-./geo_enrich.py /path/to/parsed_logs.parquet -d /path/to/GeoLite2-City.mmdb -o /path/to/enriched_logs.parquet
+python3 -m scripts.threat_enrich data/output.parquet -t data/threat -o data/enriched.parquet
 ```
 
-Display a summary of geolocation data:
+#### Combined Enrichment (Geo, ASN, and Threat Intel)
 
 ```bash
-./geo_enrich.py /path/to/parsed_logs.parquet -d /path/to/GeoLite2-City.mmdb --summary
+python3 -m scripts.enrich data/output.parquet -g data/geo/GeoLite2-City.mmdb -a data/geo/GeoLite2-ASN.mmdb -t data/threat -o data/enriched.parquet
 ```
 
-Specify a different IP column to geolocate (for destination IPs):
+Display a summary of enrichment data:
 
 ```bash
-./geo_enrich.py /path/to/parsed_logs.parquet -d /path/to/GeoLite2-City.mmdb -c dst_ip
+python3 -m scripts.enrich data/output.parquet -g data/geo/GeoLite2-City.mmdb -a data/geo/GeoLite2-ASN.mmdb -t data/threat --sample 0
+```
+
+Update threat intelligence feeds:
+
+```bash
+python3 -m scripts.update_threat_intel
 ```
 
 ### Traffic Analysis
@@ -130,29 +150,49 @@ print(f"Top source IPs: {df['src_ip'].value_counts().head(10)}")
 parse_logs("/var/log/pf/hostname/yyyy/mm/dd/pf.log", "/path/to/output.parquet")
 ```
 
-#### IP Geolocation
+#### Data Enrichment
 
 ```python
 import pandas as pd
-from pflogs.core.ip_geo import IPGeolocation, enrich_logs_with_geo
+from pflogs.core.ip_geo import IPGeolocation, enrich_with_geolocation
+from pflogs.core.threat_intel import ThreatIntelligence, enrich_with_threat_intel
 
 # Load parsed logs
 df = pd.read_parquet("/path/to/parsed_logs.parquet")
 
-# Enrich with geolocation data (high-level function)
-enriched_df = enrich_logs_with_geo(df, "/path/to/GeoLite2-City.mmdb")
+# Geo and ASN Enrichment
+geo = IPGeolocation(
+    geo_db_path="/path/to/GeoLite2-City.mmdb",
+    asn_db_path="/path/to/GeoLite2-ASN.mmdb"
+)
+geo_enriched_df = enrich_with_geolocation(
+    df, 
+    geo_db_path="/path/to/GeoLite2-City.mmdb",
+    asn_db_path="/path/to/GeoLite2-ASN.mmdb"
+)
 
-# Alternatively, use the IPGeolocation class directly
-geo = IPGeolocation("/path/to/GeoLite2-City.mmdb")
-enriched_df = geo.enrich_dataframe(df)
+# Threat Intelligence Enrichment
+threat_enriched_df = enrich_with_threat_intel(
+    geo_enriched_df,
+    threat_intel_dir="/path/to/threat"
+)
 
-# Create a DataFrame with counts by location
-location_counts = geo.create_geodata_series(df)
-print("Top source locations:")
-print(location_counts.head(10))
+# Alternatively, use the classes directly
+geo = IPGeolocation(
+    geo_db_path="/path/to/GeoLite2-City.mmdb",
+    asn_db_path="/path/to/GeoLite2-ASN.mmdb"
+)
+geo_enriched_df = geo.enrich_dataframe(df)
+
+ti = ThreatIntelligence(data_dir="/path/to/threat")
+fully_enriched_df = ti.enrich_dataframe(geo_enriched_df)
 
 # Save enriched data to a Parquet file
-enriched_df.to_parquet("/path/to/enriched_logs.parquet")
+fully_enriched_df.to_parquet("/path/to/enriched_logs.parquet")
+
+# Get threat intelligence statistics
+malicious_count = fully_enriched_df['threat_is_malicious'].sum()
+print(f"Found {malicious_count} malicious IPs ({malicious_count/len(fully_enriched_df)*100:.1f}%)")
 ```
 
 ## Development
